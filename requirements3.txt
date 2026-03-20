@@ -1,5 +1,6 @@
-streamlit
-pandas
-numpy
-matplotlib
-scikit-learn
+streamlit>=1.42
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+scikit-learn>=1.4
+openpyxl>=3.1
