@@ -3,12 +3,177 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
+from openai import OpenAI
 
 st.set_page_config(
     page_title="Meat Intelligence System",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# =========================================================
+# OPENAI / LLM
+# =========================================================
+def get_openai_client():
+    try:
+        api_key = st.secrets["OPENAI_API_KEY"]
+        return OpenAI(api_key=api_key)
+    except Exception:
+        return None
+
+
+def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None) -> str:
+    base_df = filtered_df if filtered_df is not None and len(filtered_df) > 0 else df
+
+    total_lots = len(base_df)
+    avg_risk = float(base_df["risk_score"].mean()) if "risk_score" in base_df.columns else 0
+    avg_shrink = float(base_df["historical_shrink_pct"].mean()) if "historical_shrink_pct" in base_df.columns else 0
+    avg_yield = float(base_df["actual_yield_pct"].mean()) if "actual_yield_pct" in base_df.columns else 0
+    avg_audit = float(base_df["audit_score"].mean()) if "audit_score" in base_df.columns else 0
+    avg_margin = float(base_df["gross_margin_pct"].mean()) if "gross_margin_pct" in base_df.columns else 0
+    total_inventory_value = float((base_df["inventory_units"] * base_df["price"]).sum()) if {"inventory_units", "price"}.issubset(base_df.columns) else 0
+
+    worst_store = "N/A"
+    if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df) > 0:
+        worst_store = (
+            base_df.groupby("store")["risk_score"]
+            .mean()
+            .sort_values(ascending=False)
+            .index[0]
+        )
+
+    worst_supplier = "N/A"
+    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns) and len(base_df) > 0:
+        supplier_gap = (
+            (base_df["theoretical_yield_pct"] - base_df["actual_yield_pct"])
+            .groupby(base_df["supplier"])
+            .mean()
+            .sort_values(ascending=False)
+        )
+        if len(supplier_gap) > 0:
+            worst_supplier = supplier_gap.index[0]
+
+    worst_category = "N/A"
+    if {"category", "historical_shrink_pct"}.issubset(base_df.columns) and len(base_df) > 0:
+        worst_category = (
+            base_df.groupby("category")["historical_shrink_pct"]
+            .mean()
+            .sort_values(ascending=False)
+            .index[0]
+        )
+
+    top_risk_stores = ""
+    if {"store", "risk_score"}.issubset(base_df.columns):
+        s = (
+            base_df.groupby("store")["risk_score"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        top_risk_stores = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
+
+    top_supplier_yield_gap = ""
+    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns):
+        s = (
+            (base_df["theoretical_yield_pct"] - base_df["actual_yield_pct"])
+            .groupby(base_df["supplier"])
+            .mean()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        top_supplier_yield_gap = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
+
+    top_category_shrink = ""
+    if {"category", "historical_shrink_pct"}.issubset(base_df.columns):
+        s = (
+            base_df.groupby("category")["historical_shrink_pct"]
+            .mean()
+            .sort_values(ascending=False)
+            .head(5)
+        )
+        top_category_shrink = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
+
+    risk_actions = ""
+    if "recommended_action" in base_df.columns:
+        s = base_df["recommended_action"].value_counts().head(10)
+        risk_actions = "\n".join([f"- {idx}: {val}" for idx, val in s.items()])
+
+    context = f"""
+Eres un copiloto ejecutivo para una plataforma de inteligencia operativa de carnes en autoservicio.
+Debes responder únicamente con base en el contexto y los datos proporcionados.
+Si no hay evidencia suficiente, dilo claramente.
+No inventes KPIs ni cifras.
+Responde en español, con tono ejecutivo y claro.
+
+CONTEXTO GENERAL:
+- Lotes analizados: {total_lots}
+- Riesgo promedio: {avg_risk:.2f}
+- Merma histórica promedio: {avg_shrink:.2f}
+- Rendimiento real promedio: {avg_yield:.2f}
+- Audit score promedio: {avg_audit:.2f}
+- Margen bruto promedio: {avg_margin:.2f}
+- Valor total inventario: {total_inventory_value:,.2f}
+
+HALLAZGOS PRINCIPALES:
+- Tienda con mayor riesgo promedio: {worst_store}
+- Proveedor con mayor gap de rendimiento: {worst_supplier}
+- Categoría con mayor merma histórica: {worst_category}
+
+TOP RIESGO POR TIENDA:
+{top_risk_stores}
+
+TOP GAP DE RENDIMIENTO POR PROVEEDOR:
+{top_supplier_yield_gap}
+
+TOP MERMA HISTÓRICA POR CATEGORÍA:
+{top_category_shrink}
+
+ACCIONES RECOMENDADAS MÁS FRECUENTES:
+{risk_actions}
+
+DEFINICIONES:
+- risk_score: indicador de riesgo operativo del lote
+- at_risk: 1 si el lote supera el umbral de riesgo
+- historical_shrink_pct: merma histórica porcentual
+- actual_yield_pct vs theoretical_yield_pct: compara rendimiento real vs esperado
+- audit_score: cumplimiento operativo/auditoría
+- markdown_pct: descuento aplicado
+- recommended_action: acción sugerida por reglas de negocio
+"""
+    return context.strip()
+
+
+def ask_llm(question: str, context: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        return (
+            "No encontré la API key. Agrega `OPENAI_API_KEY` en `.streamlit/secrets.toml` "
+            "o en los Secrets de Streamlit Cloud."
+        )
+
+    try:
+        response = client.responses.create(
+            model="gpt-5",
+            input=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Eres un copiloto ejecutivo de una plataforma Meat Intelligence System. "
+                        "Responde solo con base en el contexto dado. "
+                        "Sé preciso, ejecutivo y claro. "
+                        "Si falta evidencia, dilo explícitamente."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Contexto:\n{context}\n\nPregunta:\n{question}",
+                },
+            ],
+        )
+        return response.output_text
+    except Exception as e:
+        return f"Error al consultar el LLM: {e}"
+
 
 # =========================================================
 # DATA GENERATION
@@ -163,6 +328,7 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
+
 # =========================================================
 # CALCULATIONS
 # =========================================================
@@ -194,6 +360,7 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     out["anomaly_score"] = (-scores).round(4)
     return out
 
+
 def recommended_action(row: pd.Series) -> str:
     if row["remaining_days"] <= 0:
         return "Retirar / revisar inmediatamente"
@@ -209,6 +376,7 @@ def recommended_action(row: pd.Series) -> str:
         return "Revisar lote atípico"
     return "Operación normal"
 
+
 def recommended_markdown(row: pd.Series) -> int:
     if row["remaining_days"] <= 0:
         return 0
@@ -221,6 +389,7 @@ def recommended_markdown(row: pd.Series) -> int:
     if row["risk_score"] >= 55:
         return 10
     return 0
+
 
 # =========================================================
 # NORMALIZATION
@@ -247,6 +416,7 @@ def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def fill_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -261,7 +431,8 @@ def fill_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     if "purchase_qty" not in df.columns:
         if "inventory_units" in df.columns:
-            df["purchase_qty"] = (df["inventory_units"] * 1.2).round().astype(int)
+            df["purchase_qty"] = pd.to_numeric(df["inventory_units"], errors="coerce").fillna(30) * 1.2
+            df["purchase_qty"] = df["purchase_qty"].round().astype(int)
         else:
             df["purchase_qty"] = 50
 
@@ -269,10 +440,12 @@ def fill_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["received_qty"] = df["purchase_qty"]
 
     if "unit_cost" not in df.columns and "price" in df.columns:
-        df["unit_cost"] = (df["price"] * 0.72).round(2)
+        df["unit_cost"] = (pd.to_numeric(df["price"], errors="coerce").fillna(150) * 0.72).round(2)
 
-    if "gross_margin_pct" not in df.columns and "price" in df.columns and "unit_cost" in df.columns:
-        df["gross_margin_pct"] = (((df["price"] - df["unit_cost"]) / df["price"]) * 100).round(2)
+    if "gross_margin_pct" not in df.columns and {"price", "unit_cost"}.issubset(df.columns):
+        safe_price = pd.to_numeric(df["price"], errors="coerce").replace(0, np.nan).fillna(150)
+        safe_cost = pd.to_numeric(df["unit_cost"], errors="coerce").fillna(108)
+        df["gross_margin_pct"] = (((safe_price - safe_cost) / safe_price) * 100).round(2)
 
     if "theoretical_margin_pct" not in df.columns and "gross_margin_pct" in df.columns:
         df["theoretical_margin_pct"] = df["gross_margin_pct"]
@@ -290,6 +463,30 @@ def fill_missing_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["hygiene_score"] = 85.0
 
     return df
+
+
+def ensure_optional_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    optional_defaults = {
+        "production_date": pd.NaT,
+        "recv_date": pd.NaT,
+        "snapshot_date": pd.NaT,
+        "expiry_date": pd.NaT,
+        "po_number": "N/A",
+        "region": "N/A",
+        "cluster": "N/A",
+        "hygiene_score": 85.0,
+        "gross_margin_pct": 25.0,
+        "theoretical_margin_pct": 25.0,
+    }
+
+    for col, default in optional_defaults.items():
+        if col not in df.columns:
+            df[col] = default
+
+    return df
+
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = standardize_column_names(df)
@@ -338,6 +535,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def load_data(uploaded_file):
     if uploaded_file is not None:
         if uploaded_file.name.endswith(".csv"):
@@ -348,6 +546,7 @@ def load_data(uploaded_file):
         df = generate_operational_data()
 
     df = normalize_columns(df)
+    df = ensure_optional_columns(df)
 
     required_cols = [
         "lot_id", "store", "supplier", "category", "cut",
@@ -382,6 +581,7 @@ def load_data(uploaded_file):
 
     return df
 
+
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     filter_cols = st.columns(4)
 
@@ -406,6 +606,15 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         filtered = filtered[filtered["region"] == selected_region]
 
     return filtered
+
+
+def safe_show_dataframe(df: pd.DataFrame, cols: list[str]):
+    available_cols = [c for c in cols if c in df.columns]
+    if not available_cols:
+        st.warning("No hay columnas disponibles para mostrar en esta vista.")
+        return
+    st.dataframe(df[available_cols], use_container_width=True)
+
 
 # =========================================================
 # SIDEBAR
@@ -473,12 +682,12 @@ elif module == "Dashboard Operativo":
     st.title("Dashboard Operativo")
     filtered = apply_filters(df)
 
-    inventory_value = float((filtered["inventory_units"] * filtered["price"]).sum())
+    inventory_value = float((filtered["inventory_units"] * filtered["price"]).sum()) if len(filtered) else 0
 
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Lotes", len(filtered))
-    k2.metric("Lotes en riesgo", int(filtered["at_risk"].sum()))
-    k3.metric("Anomalías", int(filtered["anomaly_flag"].sum()))
+    k2.metric("Lotes en riesgo", int(filtered["at_risk"].sum()) if len(filtered) else 0)
+    k3.metric("Anomalías", int(filtered["anomaly_flag"].sum()) if len(filtered) else 0)
     k4.metric("Riesgo promedio", round(float(filtered["risk_score"].mean()), 2) if len(filtered) else 0)
     k5.metric("Valor inventario", f"${inventory_value:,.0f}")
 
@@ -492,6 +701,8 @@ elif module == "Dashboard Operativo":
             ax.bar(chart_df["store"], chart_df["risk_score"])
             plt.xticks(rotation=30, ha="right")
             st.pyplot(fig)
+        else:
+            st.info("No hay datos para mostrar.")
 
     with right:
         st.subheader("Inventario en riesgo por categoría")
@@ -500,18 +711,21 @@ elif module == "Dashboard Operativo":
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.bar(cat_df["category"], cat_df["inventory_units"])
             st.pyplot(fig)
+        else:
+            st.info("No hay datos para mostrar.")
 
+    st.subheader("Lotes prioritarios")
     priority_cols = [
         "lot_id", "store", "supplier", "category", "cut",
         "risk_score", "temp_max_c", "remaining_days",
         "inventory_units", "anomaly_flag",
         "recommended_markdown_pct", "recommended_action"
     ]
-    st.subheader("Lotes prioritarios")
-    st.dataframe(
-        filtered.sort_values(by=["risk_score", "anomaly_flag", "remaining_days"], ascending=[False, False, True])[priority_cols],
-        use_container_width=True
+    priority_df = filtered.sort_values(
+        by=["risk_score", "anomaly_flag", "remaining_days"],
+        ascending=[False, False, True],
     )
+    safe_show_dataframe(priority_df, priority_cols)
 
 elif module == "Compras y Demanda":
     st.title("Compras y Demanda")
@@ -525,13 +739,11 @@ elif module == "Compras y Demanda":
         (filtered["inventory_units"] > filtered["daily_sales"] * 5).astype(int)
     )
 
-    st.dataframe(
-        filtered[[
-            "po_number", "lot_id", "store", "supplier", "category", "cut",
-            "inventory_units", "daily_sales", "purchase_qty", "suggested_purchase_qty", "overinventory_risk"
-        ]],
-        use_container_width=True
-    )
+    cols = [
+        "po_number", "lot_id", "store", "supplier", "category", "cut",
+        "inventory_units", "daily_sales", "purchase_qty", "suggested_purchase_qty", "overinventory_risk"
+    ]
+    safe_show_dataframe(filtered, cols)
 
 elif module == "Recibo y Almacén":
     st.title("Recibo y Almacén")
@@ -541,15 +753,13 @@ elif module == "Recibo y Almacén":
     filtered["weight_diff_kg"] = (filtered["received_weight_kg"] - filtered["ordered_weight_kg"]).round(2)
     filtered["temp_rejection_flag"] = (filtered["temp_max_c"] > 7).astype(int)
 
-    st.dataframe(
-        filtered[[
-            "recv_date", "po_number", "lot_id", "store", "supplier",
-            "purchase_qty", "received_qty", "qty_diff",
-            "ordered_weight_kg", "received_weight_kg", "weight_diff_kg",
-            "temp_avg_c", "temp_max_c", "temp_rejection_flag"
-        ]],
-        use_container_width=True
-    )
+    cols = [
+        "recv_date", "po_number", "lot_id", "store", "supplier",
+        "purchase_qty", "received_qty", "qty_diff",
+        "ordered_weight_kg", "received_weight_kg", "weight_diff_kg",
+        "temp_avg_c", "temp_max_c", "temp_rejection_flag"
+    ]
+    safe_show_dataframe(filtered, cols)
 
 elif module == "Producción y Rendimientos":
     st.title("Producción y Rendimientos")
@@ -559,14 +769,12 @@ elif module == "Producción y Rendimientos":
     filtered["production_gap_kg"] = (filtered["production_actual_kg"] - filtered["production_plan_kg"]).round(2)
     filtered["low_yield_flag"] = (filtered["yield_gap"] < -5).astype(int)
 
-    st.dataframe(
-        filtered[[
-            "production_date", "lot_id", "store", "supplier", "category", "cut",
-            "theoretical_yield_pct", "actual_yield_pct", "yield_gap",
-            "production_plan_kg", "production_actual_kg", "production_gap_kg", "low_yield_flag"
-        ]],
-        use_container_width=True
-    )
+    cols = [
+        "production_date", "lot_id", "store", "supplier", "category", "cut",
+        "theoretical_yield_pct", "actual_yield_pct", "yield_gap",
+        "production_plan_kg", "production_actual_kg", "production_gap_kg", "low_yield_flag"
+    ]
+    safe_show_dataframe(filtered, cols)
 
 elif module == "Exhibición y Venta":
     st.title("Exhibición y Venta")
@@ -578,15 +786,13 @@ elif module == "Exhibición y Venta":
         (filtered["overfill_flag"] == 1)
     ).astype(int)
 
-    st.dataframe(
-        filtered[[
-            "snapshot_date", "lot_id", "store", "category", "cut",
-            "inventory_units", "daily_sales", "shelf_gaps",
-            "expired_labels", "overfill_flag", "shelf_attention_flag",
-            "markdown_pct", "gross_margin_pct"
-        ]],
-        use_container_width=True
-    )
+    cols = [
+        "snapshot_date", "lot_id", "store", "category", "cut",
+        "inventory_units", "daily_sales", "shelf_gaps",
+        "expired_labels", "overfill_flag", "shelf_attention_flag",
+        "markdown_pct", "gross_margin_pct"
+    ]
+    safe_show_dataframe(filtered, cols)
 
 elif module == "Auditoría":
     st.title("Auditoría")
@@ -596,13 +802,11 @@ elif module == "Auditoría":
         lambda x: "Crítico" if x < 70 else "Atención" if x < 85 else "Aceptable"
     )
 
-    st.dataframe(
-        filtered[[
-            "snapshot_date", "lot_id", "store", "supplier", "category", "cut",
-            "audit_score", "hygiene_score", "audit_status"
-        ]],
-        use_container_width=True
-    )
+    cols = [
+        "snapshot_date", "lot_id", "store", "supplier", "category", "cut",
+        "audit_score", "hygiene_score", "audit_status"
+    ]
+    safe_show_dataframe(filtered, cols)
 
 elif module == "Dirección y Copiloto IA":
     st.title("Dirección y Copiloto IA")
@@ -615,14 +819,29 @@ elif module == "Dirección y Copiloto IA":
     st.write(f"**Proveedor con mayor gap de rendimiento:** {worst_supplier}")
     st.write(f"**Categoría con mayor merma histórica promedio:** {worst_category}")
 
+    st.markdown("### Copiloto IA")
+    st.caption("Responde con base en los datos cargados y el contexto calculado por la plataforma.")
+
+    filtered_for_llm = apply_filters(df)
     question = st.text_input("Escribe una pregunta ejecutiva")
+
+    example_questions = [
+        "¿Qué tiendas están destruyendo margen?",
+        "¿Qué proveedor tiene peor rendimiento real vs esperado?",
+        "Resume los 5 hallazgos más importantes del día.",
+        "¿Dónde debo enfocar auditoría esta semana?",
+        "¿Qué categoría tiene mayor riesgo y por qué?",
+    ]
+    st.markdown("**Preguntas sugeridas:**")
+    for q in example_questions:
+        st.write(f"- {q}")
+
     if question:
-        q = question.lower()
-        if "tienda" in q and "riesgo" in q:
-            st.success(f"La tienda con mayor riesgo promedio es {worst_store}.")
-        elif "proveedor" in q and "rendimiento" in q:
-            st.success(f"El proveedor con peor diferencia entre rendimiento teórico y real es {worst_supplier}.")
-        elif "merma" in q or "categoría" in q:
-            st.success(f"La categoría con mayor merma histórica promedio es {worst_category}.")
-        else:
-            st.info("Versión base del copiloto: responde con reglas simples.")
+        with st.spinner("Consultando copiloto IA..."):
+            context = build_llm_context(df, filtered_for_llm)
+            answer = ask_llm(question, context)
+        st.markdown("### Respuesta del copiloto")
+        st.write(answer)
+
+        with st.expander("Ver contexto enviado al LLM"):
+            st.text(context)
