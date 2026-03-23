@@ -25,6 +25,22 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
         "Apodaca",
     ]
 
+    regions = {
+        "MTY San Pedro": "Monterrey",
+        "MTY Cumbres": "Monterrey",
+        "MTY Contry": "Monterrey",
+        "Saltillo Centro": "Saltillo",
+        "Apodaca": "Monterrey",
+    }
+
+    clusters = {
+        "MTY San Pedro": "Premium",
+        "MTY Cumbres": "Masivo",
+        "MTY Contry": "Masivo",
+        "Saltillo Centro": "Regional",
+        "Apodaca": "Masivo",
+    }
+
     suppliers = [
         "Proveedor A",
         "Proveedor B",
@@ -42,10 +58,14 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
 
     rows = []
 
+    start_date = pd.Timestamp("2026-01-01")
+
     for lot_id in range(1, n + 1):
         category = rng.choice(categories, p=[0.35, 0.40, 0.25])
         cut = rng.choice(cuts[category])
         store = rng.choice(stores)
+        region = regions[store]
+        cluster = clusters[store]
         supplier = rng.choice(suppliers)
 
         shelf_life_days = {
@@ -57,13 +77,19 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
         age_days = int(rng.integers(0, shelf_life_days + 2))
         remaining_days = shelf_life_days - age_days
 
+        recv_date = start_date + pd.Timedelta(days=int(rng.integers(0, 75)))
+        production_date = recv_date + pd.Timedelta(days=int(rng.integers(0, 2)))
+        expiry_date = recv_date + pd.Timedelta(days=shelf_life_days)
+        snapshot_date = recv_date + pd.Timedelta(days=age_days)
+
         temp_avg_c = float(np.round(rng.normal(3.5, 1.3), 2))
         temp_max_c = float(np.round(temp_avg_c + abs(rng.normal(1.4, 0.9)), 2))
         hours_out_of_range = float(np.round(max(0, rng.normal(1.6, 1.8)), 2))
 
         inventory_units = int(rng.integers(5, 100))
-        daily_sales = float(np.round(max(0.1, rng.normal(9, 4)), 2))
+        daily_sales_units = float(np.round(max(0.1, rng.normal(9, 4)), 2))
         price = float(np.round(rng.uniform(70, 380), 2))
+        unit_cost = float(np.round(price * rng.uniform(0.62, 0.82), 2))
         markdown_pct = int(rng.choice([0, 0, 0, 10, 15, 20, 25]))
         historical_shrink_pct = float(np.round(np.clip(rng.normal(7, 4), 0, 25), 2))
 
@@ -81,8 +107,11 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
         shelf_gaps = int(rng.integers(0, 8))
         expired_labels = int(rng.integers(0, 4))
         overfill_flag = int(rng.choice([0, 1], p=[0.8, 0.2]))
-
+        hygiene_score = float(np.round(np.clip(rng.normal(88, 8), 50, 100), 2))
         audit_score = float(np.round(np.clip(rng.normal(84, 10), 40, 100), 2))
+
+        gross_margin_pct = float(np.round(((price - unit_cost) / price) * 100, 2))
+        theoretical_margin_pct = float(np.round(gross_margin_pct + rng.normal(0, 2), 2))
 
         risk = (
             18 * (age_days / max(shelf_life_days, 1))
@@ -90,19 +119,40 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
             + 6 * max(temp_max_c - 5, 0)
             + 4.5 * hours_out_of_range
             + 0.12 * inventory_units
-            - 1.3 * daily_sales
+            - 1.3 * daily_sales_units
             + 0.6 * historical_shrink_pct
             - 0.35 * markdown_pct
+            + 0.25 * max(0, theoretical_yield_pct - actual_yield_pct)
         )
 
         risk += rng.normal(0, 5)
         risk_score = float(np.clip(risk, 0, 100))
         at_risk = 1 if risk_score >= 55 else 0
 
+        if remaining_days <= 0:
+            action = "Retirar / revisar inmediatamente"
+        elif temp_max_c > 7 or hours_out_of_range >= 4:
+            action = "Auditar cadena de frío"
+        elif actual_yield_pct < theoretical_yield_pct - 5:
+            action = "Revisar rendimiento y merma"
+        elif risk_score >= 75 and inventory_units > daily_sales_units:
+            action = "Markdown fuerte hoy"
+        elif risk_score >= 55:
+            action = "Priorizar venta / FEFO"
+        else:
+            action = "Operación normal"
+
         rows.append(
             {
-                "lot_id": f"L{lot_id:04d}",
+                "snapshot_date": snapshot_date.date(),
+                "recv_date": recv_date.date(),
+                "production_date": production_date.date(),
+                "expiry_date": expiry_date.date(),
+                "lot_id": f"L{lot_id:05d}",
+                "po_number": f"PO-{100000 + lot_id}",
                 "store": store,
+                "region": region,
+                "cluster": cluster,
                 "supplier": supplier,
                 "category": category,
                 "cut": cut,
@@ -113,8 +163,12 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
                 "temp_max_c": temp_max_c,
                 "hours_out_of_range": hours_out_of_range,
                 "inventory_units": inventory_units,
-                "daily_sales": daily_sales,
+                "daily_sales_units": daily_sales_units,
+                "daily_sales": daily_sales_units,
                 "price": price,
+                "unit_cost": unit_cost,
+                "gross_margin_pct": gross_margin_pct,
+                "theoretical_margin_pct": theoretical_margin_pct,
                 "markdown_pct": markdown_pct,
                 "historical_shrink_pct": historical_shrink_pct,
                 "purchase_qty": purchase_qty,
@@ -128,9 +182,11 @@ def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
                 "shelf_gaps": shelf_gaps,
                 "expired_labels": expired_labels,
                 "overfill_flag": overfill_flag,
+                "hygiene_score": hygiene_score,
                 "audit_score": audit_score,
                 "risk_score": round(risk_score, 2),
                 "at_risk": at_risk,
+                "suggested_action_source": action,
             }
         )
 
@@ -199,6 +255,28 @@ def recommended_markdown(row: pd.Series) -> int:
     return 0
 
 
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Compatibilidad con datasets más realistas
+    if "daily_sales" not in df.columns and "daily_sales_units" in df.columns:
+        df["daily_sales"] = df["daily_sales_units"]
+
+    if "daily_sales_units" not in df.columns and "daily_sales" in df.columns:
+        df["daily_sales_units"] = df["daily_sales"]
+
+    if "recv_date" in df.columns:
+        df["recv_date"] = pd.to_datetime(df["recv_date"], errors="coerce")
+    if "production_date" in df.columns:
+        df["production_date"] = pd.to_datetime(df["production_date"], errors="coerce")
+    if "expiry_date" in df.columns:
+        df["expiry_date"] = pd.to_datetime(df["expiry_date"], errors="coerce")
+    if "snapshot_date" in df.columns:
+        df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], errors="coerce")
+
+    return df
+
+
 def load_data(uploaded_file):
     if uploaded_file is not None:
         if uploaded_file.name.endswith(".csv"):
@@ -207,6 +285,8 @@ def load_data(uploaded_file):
             df = pd.read_excel(uploaded_file)
     else:
         df = generate_operational_data()
+
+    df = normalize_columns(df)
 
     required_cols = [
         "lot_id", "store", "supplier", "category", "cut",
@@ -238,6 +318,7 @@ def load_data(uploaded_file):
             - 1.3 * df["daily_sales"]
             + 0.6 * df["historical_shrink_pct"]
             - 0.35 * df["markdown_pct"]
+            + 0.25 * (df["theoretical_yield_pct"] - df["actual_yield_pct"]).clip(lower=0)
         )
         df["risk_score"] = risk.clip(0, 100).round(2)
 
@@ -245,14 +326,19 @@ def load_data(uploaded_file):
 
 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    c1, c2, c3 = st.columns(3)
+    filter_cols = st.columns(4)
 
-    with c1:
-        selected_store = st.selectbox("Tienda", ["Todas"] + sorted(df["store"].unique().tolist()))
-    with c2:
-        selected_category = st.selectbox("Categoría", ["Todas"] + sorted(df["category"].unique().tolist()))
-    with c3:
-        selected_supplier = st.selectbox("Proveedor", ["Todos"] + sorted(df["supplier"].unique().tolist()))
+    with filter_cols[0]:
+        selected_store = st.selectbox("Tienda", ["Todas"] + sorted(df["store"].dropna().unique().tolist()))
+    with filter_cols[1]:
+        selected_category = st.selectbox("Categoría", ["Todas"] + sorted(df["category"].dropna().unique().tolist()))
+    with filter_cols[2]:
+        selected_supplier = st.selectbox("Proveedor", ["Todos"] + sorted(df["supplier"].dropna().unique().tolist()))
+    with filter_cols[3]:
+        if "region" in df.columns:
+            selected_region = st.selectbox("Región", ["Todas"] + sorted(df["region"].dropna().unique().tolist()))
+        else:
+            selected_region = "Todas"
 
     filtered = df.copy()
 
@@ -262,6 +348,8 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
         filtered = filtered[filtered["category"] == selected_category]
     if selected_supplier != "Todos":
         filtered = filtered[filtered["supplier"] == selected_supplier]
+    if selected_region != "Todas" and "region" in filtered.columns:
+        filtered = filtered[filtered["region"] == selected_region]
 
     return filtered
 
@@ -293,6 +381,8 @@ module = st.sidebar.radio(
 
 risk_threshold = st.sidebar.slider("Umbral de riesgo", 0, 100, 55, 5)
 
+show_raw_data = st.sidebar.checkbox("Mostrar muestra de datos", value=False)
+
 # =========================================================
 # DATA PREP
 # =========================================================
@@ -306,6 +396,9 @@ except Exception as e:
     st.error(f"Error al cargar datos: {e}")
     st.stop()
 
+if show_raw_data:
+    st.subheader("Muestra de datos cargados")
+    st.dataframe(df.head(20), use_container_width=True)
 
 # =========================================================
 # PAGES
@@ -328,11 +421,12 @@ if module == "Inicio":
 
     st.info("Usa el menú lateral para navegar entre módulos.")
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Lotes totales", len(df))
     k2.metric("Riesgo promedio", round(float(df["risk_score"].mean()), 2))
     k3.metric("Merma histórica prom.", round(float(df["historical_shrink_pct"].mean()), 2))
     k4.metric("Audit score prom.", round(float(df["audit_score"].mean()), 2))
+    k5.metric("Rendimiento real prom.", round(float(df["actual_yield_pct"].mean()), 2))
 
     st.markdown("### Formato esperado del archivo")
     st.dataframe(df.head(10), use_container_width=True)
@@ -341,42 +435,53 @@ elif module == "Dashboard Operativo":
     st.title("Dashboard Operativo")
     filtered = apply_filters(df)
 
+    inventory_value = float((filtered["inventory_units"] * filtered["price"]).sum())
+    risk_lots = int(filtered["at_risk"].sum())
+    anomaly_lots = int(filtered["anomaly_flag"].sum())
+    avg_risk = round(float(filtered["risk_score"].mean()), 2) if len(filtered) else 0
+
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Lotes", len(filtered))
-    k2.metric("Lotes en riesgo", int(filtered["at_risk"].sum()))
-    k3.metric("Anomalías", int(filtered["anomaly_flag"].sum()))
-    k4.metric("Riesgo promedio", round(float(filtered["risk_score"].mean()), 2))
-    k5.metric("Valor inventario", f"${(filtered['inventory_units'] * filtered['price']).sum():,.0f}")
+    k2.metric("Lotes en riesgo", risk_lots)
+    k3.metric("Anomalías", anomaly_lots)
+    k4.metric("Riesgo promedio", avg_risk)
+    k5.metric("Valor inventario", f"${inventory_value:,.0f}")
 
     left, right = st.columns(2)
 
     with left:
         st.subheader("Riesgo promedio por tienda")
-        chart_df = (
-            filtered.groupby("store", as_index=False)["risk_score"]
-            .mean()
-            .sort_values("risk_score", ascending=False)
-        )
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(chart_df["store"], chart_df["risk_score"])
-        ax.set_ylabel("Risk score promedio")
-        ax.set_xlabel("Tienda")
-        plt.xticks(rotation=30, ha="right")
-        st.pyplot(fig)
+        if len(filtered):
+            chart_df = (
+                filtered.groupby("store", as_index=False)["risk_score"]
+                .mean()
+                .sort_values("risk_score", ascending=False)
+            )
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(chart_df["store"], chart_df["risk_score"])
+            ax.set_ylabel("Risk score promedio")
+            ax.set_xlabel("Tienda")
+            plt.xticks(rotation=30, ha="right")
+            st.pyplot(fig)
+        else:
+            st.info("No hay datos para mostrar.")
 
     with right:
         st.subheader("Inventario en riesgo por categoría")
-        cat_df = (
-            filtered[filtered["at_risk"] == 1]
-            .groupby("category", as_index=False)["inventory_units"]
-            .sum()
-            .sort_values("inventory_units", ascending=False)
-        )
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.bar(cat_df["category"], cat_df["inventory_units"])
-        ax.set_ylabel("Unidades")
-        ax.set_xlabel("Categoría")
-        st.pyplot(fig)
+        if len(filtered):
+            cat_df = (
+                filtered[filtered["at_risk"] == 1]
+                .groupby("category", as_index=False)["inventory_units"]
+                .sum()
+                .sort_values("inventory_units", ascending=False)
+            )
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(cat_df["category"], cat_df["inventory_units"])
+            ax.set_ylabel("Unidades")
+            ax.set_xlabel("Categoría")
+            st.pyplot(fig)
+        else:
+            st.info("No hay datos para mostrar.")
 
     st.subheader("Lotes prioritarios")
     priority_cols = [
@@ -394,7 +499,7 @@ elif module == "Dashboard Operativo":
 
 elif module == "Compras y Demanda":
     st.title("Compras y Demanda")
-    filtered = apply_filters(df)
+    filtered = apply_filters(df).copy()
 
     filtered["suggested_purchase_qty"] = (
         filtered["daily_sales"] * 3 - filtered["inventory_units"] * 0.25
@@ -411,9 +516,10 @@ elif module == "Compras y Demanda":
 
     st.subheader("Sugerencia de compra")
     cols = [
-        "lot_id", "store", "supplier", "category", "cut",
+        "po_number", "lot_id", "store", "supplier", "category", "cut",
         "inventory_units", "daily_sales", "suggested_purchase_qty", "overinventory_risk"
     ]
+    cols = [c for c in cols if c in filtered.columns]
     st.dataframe(filtered[cols], use_container_width=True)
 
     summary = (
@@ -429,7 +535,7 @@ elif module == "Compras y Demanda":
 
 elif module == "Recibo y Almacén":
     st.title("Recibo y Almacén")
-    filtered = apply_filters(df)
+    filtered = apply_filters(df).copy()
 
     filtered["qty_diff"] = filtered["received_qty"] - filtered["purchase_qty"]
     filtered["weight_diff_kg"] = (
@@ -444,15 +550,17 @@ elif module == "Recibo y Almacén":
 
     st.subheader("Validación de recibo")
     cols = [
-        "lot_id", "store", "supplier", "purchase_qty", "received_qty",
-        "qty_diff", "ordered_weight_kg", "received_weight_kg",
+        "recv_date", "po_number", "lot_id", "store", "supplier",
+        "purchase_qty", "received_qty", "qty_diff",
+        "ordered_weight_kg", "received_weight_kg",
         "weight_diff_kg", "temp_avg_c", "temp_max_c", "temp_rejection_flag"
     ]
+    cols = [c for c in cols if c in filtered.columns]
     st.dataframe(filtered[cols], use_container_width=True)
 
 elif module == "Producción y Rendimientos":
     st.title("Producción y Rendimientos")
-    filtered = apply_filters(df)
+    filtered = apply_filters(df).copy()
 
     filtered["yield_gap"] = (
         filtered["actual_yield_pct"] - filtered["theoretical_yield_pct"]
@@ -471,15 +579,16 @@ elif module == "Producción y Rendimientos":
 
     st.subheader("Detalle de rendimientos")
     cols = [
-        "lot_id", "store", "supplier", "category", "cut",
+        "production_date", "lot_id", "store", "supplier", "category", "cut",
         "theoretical_yield_pct", "actual_yield_pct", "yield_gap",
         "production_plan_kg", "production_actual_kg", "production_gap_kg", "low_yield_flag"
     ]
+    cols = [c for c in cols if c in filtered.columns]
     st.dataframe(filtered[cols], use_container_width=True)
 
 elif module == "Exhibición y Venta":
     st.title("Exhibición y Venta")
-    filtered = apply_filters(df)
+    filtered = apply_filters(df).copy()
 
     filtered["shelf_attention_flag"] = (
         (filtered["shelf_gaps"] > 2)
@@ -494,15 +603,16 @@ elif module == "Exhibición y Venta":
 
     st.subheader("Control de exhibición")
     cols = [
-        "lot_id", "store", "category", "cut", "inventory_units",
+        "snapshot_date", "lot_id", "store", "category", "cut", "inventory_units",
         "daily_sales", "shelf_gaps", "expired_labels",
-        "overfill_flag", "shelf_attention_flag"
+        "overfill_flag", "shelf_attention_flag", "markdown_pct", "gross_margin_pct"
     ]
+    cols = [c for c in cols if c in filtered.columns]
     st.dataframe(filtered[cols], use_container_width=True)
 
 elif module == "Auditoría":
     st.title("Auditoría")
-    filtered = apply_filters(df)
+    filtered = apply_filters(df).copy()
 
     filtered["audit_status"] = filtered["audit_score"].apply(
         lambda x: "Crítico" if x < 70 else "Atención" if x < 85 else "Aceptable"
@@ -515,9 +625,10 @@ elif module == "Auditoría":
 
     st.subheader("Resultados de auditoría")
     cols = [
-        "lot_id", "store", "supplier", "category", "cut",
-        "audit_score", "audit_status"
+        "snapshot_date", "lot_id", "store", "supplier", "category", "cut",
+        "audit_score", "hygiene_score", "audit_status"
     ]
+    cols = [c for c in cols if c in filtered.columns]
     st.dataframe(filtered[cols], use_container_width=True)
 
 elif module == "Dirección y Copiloto IA":
@@ -530,10 +641,12 @@ elif module == "Dirección y Copiloto IA":
         "Merma histórica promedio": round(float(df["historical_shrink_pct"].mean()), 2),
         "Rendimiento real promedio": round(float(df["actual_yield_pct"].mean()), 2),
         "Audit score promedio": round(float(df["audit_score"].mean()), 2),
+        "Margen bruto promedio": round(float(df["gross_margin_pct"].mean()), 2) if "gross_margin_pct" in df.columns else None,
     }
 
     for key, value in summary.items():
-        st.write(f"**{key}:** {value}")
+        if value is not None:
+            st.write(f"**{key}:** {value}")
 
     st.subheader("Preguntas sugeridas al copiloto")
     questions = [
@@ -586,3 +699,4 @@ elif module == "Dirección y Copiloto IA":
             st.success(f"La categoría con mayor merma histórica promedio es {worst_category}.")
         else:
             st.info("Versión base del copiloto: responde con reglas simples. Después se puede conectar a un LLM.")
+            
