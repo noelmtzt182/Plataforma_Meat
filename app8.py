@@ -1,9 +1,15 @@
+import os
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 from sklearn.ensemble import IsolationForest
-from openai import OpenAI
+
+# Import seguro del SDK de OpenAI
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 st.set_page_config(
     page_title="Meat Intelligence System",
@@ -14,24 +20,53 @@ st.set_page_config(
 # =========================================================
 # OPENAI / LLM
 # =========================================================
-def get_openai_client():
+def get_api_key():
+    # 1) Streamlit secrets
     try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-        return OpenAI(api_key=api_key)
+        return st.secrets["OPENAI_API_KEY"]
     except Exception:
-        return None
+        pass
+
+    # 2) Variable de entorno
+    return os.getenv("OPENAI_API_KEY")
+
+
+def get_openai_client():
+    if OpenAI is None:
+        return None, "La librería 'openai' no está instalada."
+
+    api_key = get_api_key()
+    if not api_key:
+        return None, (
+            "No encontré la API key. Agrega OPENAI_API_KEY en "
+            ".streamlit/secrets.toml o en los Secrets de Streamlit Cloud, "
+            "o como variable de entorno."
+        )
+
+    try:
+        client = OpenAI(api_key=api_key)
+        return client, None
+    except Exception as e:
+        return None, f"No se pudo inicializar el cliente OpenAI: {e}"
+
+
+def llm_status_text():
+    client, err = get_openai_client()
+    if client is not None:
+        return "LLM listo"
+    return f"LLM no disponible: {err}"
 
 
 def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None) -> str:
     base_df = filtered_df if filtered_df is not None and len(filtered_df) > 0 else df
 
     total_lots = len(base_df)
-    avg_risk = float(base_df["risk_score"].mean()) if "risk_score" in base_df.columns else 0
-    avg_shrink = float(base_df["historical_shrink_pct"].mean()) if "historical_shrink_pct" in base_df.columns else 0
-    avg_yield = float(base_df["actual_yield_pct"].mean()) if "actual_yield_pct" in base_df.columns else 0
-    avg_audit = float(base_df["audit_score"].mean()) if "audit_score" in base_df.columns else 0
-    avg_margin = float(base_df["gross_margin_pct"].mean()) if "gross_margin_pct" in base_df.columns else 0
-    total_inventory_value = float((base_df["inventory_units"] * base_df["price"]).sum()) if {"inventory_units", "price"}.issubset(base_df.columns) else 0
+    avg_risk = float(base_df["risk_score"].mean()) if "risk_score" in base_df.columns and len(base_df) else 0
+    avg_shrink = float(base_df["historical_shrink_pct"].mean()) if "historical_shrink_pct" in base_df.columns and len(base_df) else 0
+    avg_yield = float(base_df["actual_yield_pct"].mean()) if "actual_yield_pct" in base_df.columns and len(base_df) else 0
+    avg_audit = float(base_df["audit_score"].mean()) if "audit_score" in base_df.columns and len(base_df) else 0
+    avg_margin = float(base_df["gross_margin_pct"].mean()) if "gross_margin_pct" in base_df.columns and len(base_df) else 0
+    total_inventory_value = float((base_df["inventory_units"] * base_df["price"]).sum()) if {"inventory_units", "price"}.issubset(base_df.columns) and len(base_df) else 0
 
     worst_store = "N/A"
     if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df) > 0:
@@ -63,7 +98,7 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
         )
 
     top_risk_stores = ""
-    if {"store", "risk_score"}.issubset(base_df.columns):
+    if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df) > 0:
         s = (
             base_df.groupby("store")["risk_score"]
             .mean()
@@ -73,7 +108,7 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
         top_risk_stores = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
 
     top_supplier_yield_gap = ""
-    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns):
+    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns) and len(base_df) > 0:
         s = (
             (base_df["theoretical_yield_pct"] - base_df["actual_yield_pct"])
             .groupby(base_df["supplier"])
@@ -84,7 +119,7 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
         top_supplier_yield_gap = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
 
     top_category_shrink = ""
-    if {"category", "historical_shrink_pct"}.issubset(base_df.columns):
+    if {"category", "historical_shrink_pct"}.issubset(base_df.columns) and len(base_df) > 0:
         s = (
             base_df.groupby("category")["historical_shrink_pct"]
             .mean()
@@ -94,7 +129,7 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
         top_category_shrink = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
 
     risk_actions = ""
-    if "recommended_action" in base_df.columns:
+    if "recommended_action" in base_df.columns and len(base_df) > 0:
         s = base_df["recommended_action"].value_counts().head(10)
         risk_actions = "\n".join([f"- {idx}: {val}" for idx, val in s.items()])
 
@@ -144,12 +179,9 @@ DEFINICIONES:
 
 
 def ask_llm(question: str, context: str) -> str:
-    client = get_openai_client()
+    client, err = get_openai_client()
     if client is None:
-        return (
-            "No encontré la API key. Agrega `OPENAI_API_KEY` en `.streamlit/secrets.toml` "
-            "o en los Secrets de Streamlit Cloud."
-        )
+        return err
 
     try:
         response = client.responses.create(
@@ -621,6 +653,7 @@ def safe_show_dataframe(df: pd.DataFrame, cols: list[str]):
 # =========================================================
 st.sidebar.title("Meat Intelligence System™")
 st.sidebar.markdown("Plataforma integral para la industria cárnica")
+st.sidebar.caption(llm_status_text())
 
 uploaded_file = st.sidebar.file_uploader(
     "Sube tu archivo CSV o Excel",
@@ -812,7 +845,13 @@ elif module == "Dirección y Copiloto IA":
     st.title("Dirección y Copiloto IA")
 
     worst_store = df.groupby("store")["risk_score"].mean().sort_values(ascending=False).index[0]
-    worst_supplier = ((df["theoretical_yield_pct"] - df["actual_yield_pct"]).groupby(df["supplier"]).mean().sort_values(ascending=False).index[0])
+    worst_supplier = (
+        (df["theoretical_yield_pct"] - df["actual_yield_pct"])
+        .groupby(df["supplier"])
+        .mean()
+        .sort_values(ascending=False)
+        .index[0]
+    )
     worst_category = df.groupby("category")["historical_shrink_pct"].mean().sort_values(ascending=False).index[0]
 
     st.write(f"**Tienda con mayor riesgo promedio:** {worst_store}")
