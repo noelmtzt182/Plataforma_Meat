@@ -3,7 +3,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from sklearn.ensemble import IsolationForest
+
+from sklearn.ensemble import IsolationForest, RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score, roc_auc_score
 
 # Import seguro del SDK de OpenAI
 try:
@@ -21,13 +24,10 @@ st.set_page_config(
 # OPENAI / LLM
 # =========================================================
 def get_api_key():
-    # 1) Streamlit secrets
     try:
         return st.secrets["OPENAI_API_KEY"]
     except Exception:
         pass
-
-    # 2) Variable de entorno
     return os.getenv("OPENAI_API_KEY")
 
 
@@ -39,7 +39,7 @@ def get_openai_client():
     if not api_key:
         return None, (
             "No encontré la API key. Agrega OPENAI_API_KEY en "
-            ".streamlit/secrets.toml o en los Secrets de Streamlit Cloud, "
+            ".streamlit/secrets.toml, en los Secrets de Streamlit Cloud "
             "o como variable de entorno."
         )
 
@@ -62,14 +62,14 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
 
     total_lots = len(base_df)
     avg_risk = float(base_df["risk_score"].mean()) if "risk_score" in base_df.columns and len(base_df) else 0
+    avg_pred_prob = float(base_df["predicted_shrink_prob"].mean()) if "predicted_shrink_prob" in base_df.columns and len(base_df) else 0
     avg_shrink = float(base_df["historical_shrink_pct"].mean()) if "historical_shrink_pct" in base_df.columns and len(base_df) else 0
     avg_yield = float(base_df["actual_yield_pct"].mean()) if "actual_yield_pct" in base_df.columns and len(base_df) else 0
     avg_audit = float(base_df["audit_score"].mean()) if "audit_score" in base_df.columns and len(base_df) else 0
     avg_margin = float(base_df["gross_margin_pct"].mean()) if "gross_margin_pct" in base_df.columns and len(base_df) else 0
-    total_inventory_value = float((base_df["inventory_units"] * base_df["price"]).sum()) if {"inventory_units", "price"}.issubset(base_df.columns) and len(base_df) else 0
 
     worst_store = "N/A"
-    if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df) > 0:
+    if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df):
         worst_store = (
             base_df.groupby("store")["risk_score"]
             .mean()
@@ -78,18 +78,18 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
         )
 
     worst_supplier = "N/A"
-    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns) and len(base_df) > 0:
-        supplier_gap = (
+    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns) and len(base_df):
+        gap = (
             (base_df["theoretical_yield_pct"] - base_df["actual_yield_pct"])
             .groupby(base_df["supplier"])
             .mean()
             .sort_values(ascending=False)
         )
-        if len(supplier_gap) > 0:
-            worst_supplier = supplier_gap.index[0]
+        if len(gap):
+            worst_supplier = gap.index[0]
 
     worst_category = "N/A"
-    if {"category", "historical_shrink_pct"}.issubset(base_df.columns) and len(base_df) > 0:
+    if {"category", "historical_shrink_pct"}.issubset(base_df.columns) and len(base_df):
         worst_category = (
             base_df.groupby("category")["historical_shrink_pct"]
             .mean()
@@ -97,45 +97,25 @@ def build_llm_context(df: pd.DataFrame, filtered_df: pd.DataFrame | None = None)
             .index[0]
         )
 
-    top_risk_stores = ""
-    if {"store", "risk_score"}.issubset(base_df.columns) and len(base_df) > 0:
-        s = (
-            base_df.groupby("store")["risk_score"]
-            .mean()
-            .sort_values(ascending=False)
-            .head(5)
-        )
-        top_risk_stores = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
-
-    top_supplier_yield_gap = ""
-    if {"supplier", "theoretical_yield_pct", "actual_yield_pct"}.issubset(base_df.columns) and len(base_df) > 0:
-        s = (
-            (base_df["theoretical_yield_pct"] - base_df["actual_yield_pct"])
-            .groupby(base_df["supplier"])
-            .mean()
-            .sort_values(ascending=False)
-            .head(5)
-        )
-        top_supplier_yield_gap = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
-
-    top_category_shrink = ""
-    if {"category", "historical_shrink_pct"}.issubset(base_df.columns) and len(base_df) > 0:
-        s = (
-            base_df.groupby("category")["historical_shrink_pct"]
-            .mean()
-            .sort_values(ascending=False)
-            .head(5)
-        )
-        top_category_shrink = "\n".join([f"- {idx}: {val:.2f}" for idx, val in s.items()])
-
-    risk_actions = ""
-    if "recommended_action" in base_df.columns and len(base_df) > 0:
+    top_actions = ""
+    if "recommended_action" in base_df.columns and len(base_df):
         s = base_df["recommended_action"].value_counts().head(10)
-        risk_actions = "\n".join([f"- {idx}: {val}" for idx, val in s.items()])
+        top_actions = "\n".join([f"- {k}: {v}" for k, v in s.items()])
+
+    top_predicted = ""
+    if "predicted_shrink_prob" in base_df.columns and len(base_df):
+        top_df = base_df.sort_values("predicted_shrink_prob", ascending=False).head(5)
+        lines = []
+        for _, row in top_df.iterrows():
+            lines.append(
+                f"- {row.get('lot_id','N/A')} | tienda {row.get('store','N/A')} | "
+                f"cat {row.get('category','N/A')} | prob {row.get('predicted_shrink_prob',0):.2f}"
+            )
+        top_predicted = "\n".join(lines)
 
     context = f"""
 Eres un copiloto ejecutivo para una plataforma de inteligencia operativa de carnes en autoservicio.
-Debes responder únicamente con base en el contexto y los datos proporcionados.
+Responde únicamente con base en el contexto y los datos proporcionados.
 Si no hay evidencia suficiente, dilo claramente.
 No inventes KPIs ni cifras.
 Responde en español, con tono ejecutivo y claro.
@@ -143,37 +123,32 @@ Responde en español, con tono ejecutivo y claro.
 CONTEXTO GENERAL:
 - Lotes analizados: {total_lots}
 - Riesgo promedio: {avg_risk:.2f}
+- Probabilidad predictiva promedio de merma/riesgo: {avg_pred_prob:.2f}
 - Merma histórica promedio: {avg_shrink:.2f}
 - Rendimiento real promedio: {avg_yield:.2f}
 - Audit score promedio: {avg_audit:.2f}
 - Margen bruto promedio: {avg_margin:.2f}
-- Valor total inventario: {total_inventory_value:,.2f}
 
-HALLAZGOS PRINCIPALES:
+HALLAZGOS:
 - Tienda con mayor riesgo promedio: {worst_store}
 - Proveedor con mayor gap de rendimiento: {worst_supplier}
 - Categoría con mayor merma histórica: {worst_category}
 
-TOP RIESGO POR TIENDA:
-{top_risk_stores}
-
-TOP GAP DE RENDIMIENTO POR PROVEEDOR:
-{top_supplier_yield_gap}
-
-TOP MERMA HISTÓRICA POR CATEGORÍA:
-{top_category_shrink}
+TOP LOTES PREDICTIVOS:
+{top_predicted}
 
 ACCIONES RECOMENDADAS MÁS FRECUENTES:
-{risk_actions}
+{top_actions}
 
 DEFINICIONES:
-- risk_score: indicador de riesgo operativo del lote
-- at_risk: 1 si el lote supera el umbral de riesgo
+- risk_score: indicador actual de riesgo operativo del lote
+- predicted_shrink_prob: probabilidad predictiva de riesgo/merma
+- predicted_shrink_flag: bandera predictiva de riesgo
 - historical_shrink_pct: merma histórica porcentual
-- actual_yield_pct vs theoretical_yield_pct: compara rendimiento real vs esperado
-- audit_score: cumplimiento operativo/auditoría
+- actual_yield_pct vs theoretical_yield_pct: rendimiento real vs esperado
+- audit_score: cumplimiento operativo
 - markdown_pct: descuento aplicado
-- recommended_action: acción sugerida por reglas de negocio
+- recommended_action: acción sugerida por reglas
 """
     return context.strip()
 
@@ -190,10 +165,9 @@ def ask_llm(question: str, context: str) -> str:
                 {
                     "role": "system",
                     "content": (
-                        "Eres un copiloto ejecutivo de una plataforma Meat Intelligence System. "
-                        "Responde solo con base en el contexto dado. "
-                        "Sé preciso, ejecutivo y claro. "
-                        "Si falta evidencia, dilo explícitamente."
+                        "Eres un copiloto ejecutivo de Meat Intelligence System. "
+                        "Responde solo con base en el contexto. "
+                        "Sé claro, ejecutivo y preciso."
                     ),
                 },
                 {
@@ -211,7 +185,7 @@ def ask_llm(question: str, context: str) -> str:
 # DATA GENERATION
 # =========================================================
 @st.cache_data
-def generate_operational_data(n: int = 300, seed: int = 42) -> pd.DataFrame:
+def generate_operational_data(n: int = 500, seed: int = 42) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
 
     stores = ["MTY San Pedro", "MTY Cumbres", "MTY Contry", "Saltillo Centro", "Apodaca"]
@@ -445,7 +419,6 @@ def standardize_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
     existing_renames = {k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns}
     df = df.rename(columns=existing_renames)
-
     return df
 
 
@@ -649,6 +622,124 @@ def safe_show_dataframe(df: pd.DataFrame, cols: list[str]):
 
 
 # =========================================================
+# PREDICTIVE MODEL
+# =========================================================
+PREDICTIVE_FEATURES = [
+    "age_days",
+    "remaining_days",
+    "temp_avg_c",
+    "temp_max_c",
+    "hours_out_of_range",
+    "inventory_units",
+    "daily_sales",
+    "markdown_pct",
+    "historical_shrink_pct",
+    "theoretical_yield_pct",
+    "actual_yield_pct",
+    "audit_score",
+    "price",
+    "purchase_qty",
+    "received_qty",
+    "shelf_gaps",
+    "expired_labels",
+    "overfill_flag",
+]
+
+@st.cache_resource
+def train_predictive_model(model_df_hashable: tuple):
+    # placeholder for cache signature only
+    return None
+
+def build_predictive_target(df: pd.DataFrame) -> pd.Series:
+    # Target sintético/operativo: combina riesgo actual y señales de merma
+    target = (
+        (df["risk_score"] >= 55) |
+        (df["historical_shrink_pct"] >= 10) |
+        (df["remaining_days"] <= 1) |
+        (df["hours_out_of_range"] >= 4) |
+        ((df["theoretical_yield_pct"] - df["actual_yield_pct"]) >= 5)
+    ).astype(int)
+    return target
+
+
+def fit_predictive_model(df: pd.DataFrame):
+    model_df = df.copy()
+
+    for col in PREDICTIVE_FEATURES:
+        if col not in model_df.columns:
+            model_df[col] = 0
+
+    X = model_df[PREDICTIVE_FEATURES].copy()
+    X = X.apply(pd.to_numeric, errors="coerce").fillna(0)
+
+    y = build_predictive_target(model_df)
+
+    # evitar error si solo hay una clase
+    if y.nunique() < 2 or len(X) < 20:
+        model_df["predicted_shrink_prob"] = model_df["risk_score"] / 100.0
+        model_df["predicted_shrink_flag"] = (model_df["predicted_shrink_prob"] >= 0.55).astype(int)
+
+        metrics = {
+            "model_type": "fallback_rules",
+            "accuracy": None,
+            "roc_auc": None,
+            "report": "No hubo suficiente diversidad de clases para entrenar el modelo. Se usó fallback basado en risk_score."
+        }
+        return model_df, None, metrics
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=0.2,
+        random_state=42,
+        stratify=y
+    )
+
+    model = RandomForestClassifier(
+        n_estimators=250,
+        max_depth=8,
+        min_samples_split=8,
+        min_samples_leaf=4,
+        random_state=42,
+        class_weight="balanced"
+    )
+
+    model.fit(X_train, y_train)
+
+    test_preds = model.predict(X_test)
+    test_probs = model.predict_proba(X_test)[:, 1]
+
+    model_df["predicted_shrink_prob"] = model.predict_proba(X)[:, 1]
+    model_df["predicted_shrink_flag"] = (model_df["predicted_shrink_prob"] >= 0.55).astype(int)
+
+    try:
+        roc_auc = roc_auc_score(y_test, test_probs)
+    except Exception:
+        roc_auc = None
+
+    report = classification_report(y_test, test_preds, zero_division=0)
+    acc = accuracy_score(y_test, test_preds)
+
+    metrics = {
+        "model_type": "RandomForestClassifier",
+        "accuracy": acc,
+        "roc_auc": roc_auc,
+        "report": report
+    }
+
+    return model_df, model, metrics
+
+
+def get_feature_importance(model, feature_names):
+    if model is None or not hasattr(model, "feature_importances_"):
+        return pd.DataFrame(columns=["feature", "importance"])
+    imp = pd.DataFrame({
+        "feature": feature_names,
+        "importance": model.feature_importances_
+    }).sort_values("importance", ascending=False)
+    return imp
+
+
+# =========================================================
 # SIDEBAR
 # =========================================================
 st.sidebar.title("Meat Intelligence System™")
@@ -670,6 +761,7 @@ module = st.sidebar.radio(
         "Producción y Rendimientos",
         "Exhibición y Venta",
         "Auditoría",
+        "Predictivo",
         "Dirección y Copiloto IA",
     ]
 )
@@ -678,7 +770,7 @@ risk_threshold = st.sidebar.slider("Umbral de riesgo", 0, 100, 55, 5)
 show_raw_data = st.sidebar.checkbox("Mostrar muestra de datos", value=False)
 
 # =========================================================
-# LOAD
+# LOAD + MODEL
 # =========================================================
 try:
     df = load_data(uploaded_file)
@@ -686,6 +778,10 @@ try:
     df["at_risk"] = (df["risk_score"] >= risk_threshold).astype(int)
     df["recommended_markdown_pct"] = df.apply(recommended_markdown, axis=1)
     df["recommended_action"] = df.apply(recommended_action, axis=1)
+
+    df, predictive_model, predictive_metrics = fit_predictive_model(df)
+    feature_importance_df = get_feature_importance(predictive_model, PREDICTIVE_FEATURES)
+
 except Exception as e:
     st.error(f"Error al cargar datos: {e}")
     st.stop()
@@ -702,12 +798,13 @@ if module == "Inicio":
     st.subheader("Plataforma de inteligencia operativa para la industria cárnica")
     st.info("Usa el menú lateral para navegar entre módulos.")
 
-    k1, k2, k3, k4, k5 = st.columns(5)
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Lotes totales", len(df))
     k2.metric("Riesgo promedio", round(float(df["risk_score"].mean()), 2))
-    k3.metric("Merma histórica prom.", round(float(df["historical_shrink_pct"].mean()), 2))
-    k4.metric("Audit score prom.", round(float(df["audit_score"].mean()), 2))
-    k5.metric("Rendimiento real prom.", round(float(df["actual_yield_pct"].mean()), 2))
+    k3.metric("Prob. predictiva prom.", round(float(df["predicted_shrink_prob"].mean()), 2))
+    k4.metric("Merma histórica prom.", round(float(df["historical_shrink_pct"].mean()), 2))
+    k5.metric("Audit score prom.", round(float(df["audit_score"].mean()), 2))
+    k6.metric("Rendimiento real prom.", round(float(df["actual_yield_pct"].mean()), 2))
 
     st.dataframe(df.head(10), use_container_width=True)
 
@@ -732,6 +829,7 @@ elif module == "Dashboard Operativo":
             chart_df = filtered.groupby("store", as_index=False)["risk_score"].mean().sort_values("risk_score", ascending=False)
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.bar(chart_df["store"], chart_df["risk_score"])
+            ax.set_ylabel("Risk score promedio")
             plt.xticks(rotation=30, ha="right")
             st.pyplot(fig)
         else:
@@ -743,6 +841,7 @@ elif module == "Dashboard Operativo":
             cat_df = filtered[filtered["at_risk"] == 1].groupby("category", as_index=False)["inventory_units"].sum()
             fig, ax = plt.subplots(figsize=(8, 4))
             ax.bar(cat_df["category"], cat_df["inventory_units"])
+            ax.set_ylabel("Unidades")
             st.pyplot(fig)
         else:
             st.info("No hay datos para mostrar.")
@@ -750,12 +849,12 @@ elif module == "Dashboard Operativo":
     st.subheader("Lotes prioritarios")
     priority_cols = [
         "lot_id", "store", "supplier", "category", "cut",
-        "risk_score", "temp_max_c", "remaining_days",
+        "risk_score", "predicted_shrink_prob", "temp_max_c", "remaining_days",
         "inventory_units", "anomaly_flag",
         "recommended_markdown_pct", "recommended_action"
     ]
     priority_df = filtered.sort_values(
-        by=["risk_score", "anomaly_flag", "remaining_days"],
+        by=["predicted_shrink_prob", "risk_score", "remaining_days"],
         ascending=[False, False, True],
     )
     safe_show_dataframe(priority_df, priority_cols)
@@ -774,7 +873,8 @@ elif module == "Compras y Demanda":
 
     cols = [
         "po_number", "lot_id", "store", "supplier", "category", "cut",
-        "inventory_units", "daily_sales", "purchase_qty", "suggested_purchase_qty", "overinventory_risk"
+        "inventory_units", "daily_sales", "purchase_qty",
+        "suggested_purchase_qty", "overinventory_risk", "predicted_shrink_prob"
     ]
     safe_show_dataframe(filtered, cols)
 
@@ -790,7 +890,7 @@ elif module == "Recibo y Almacén":
         "recv_date", "po_number", "lot_id", "store", "supplier",
         "purchase_qty", "received_qty", "qty_diff",
         "ordered_weight_kg", "received_weight_kg", "weight_diff_kg",
-        "temp_avg_c", "temp_max_c", "temp_rejection_flag"
+        "temp_avg_c", "temp_max_c", "temp_rejection_flag", "predicted_shrink_prob"
     ]
     safe_show_dataframe(filtered, cols)
 
@@ -805,7 +905,8 @@ elif module == "Producción y Rendimientos":
     cols = [
         "production_date", "lot_id", "store", "supplier", "category", "cut",
         "theoretical_yield_pct", "actual_yield_pct", "yield_gap",
-        "production_plan_kg", "production_actual_kg", "production_gap_kg", "low_yield_flag"
+        "production_plan_kg", "production_actual_kg", "production_gap_kg",
+        "low_yield_flag", "predicted_shrink_prob"
     ]
     safe_show_dataframe(filtered, cols)
 
@@ -823,7 +924,7 @@ elif module == "Exhibición y Venta":
         "snapshot_date", "lot_id", "store", "category", "cut",
         "inventory_units", "daily_sales", "shelf_gaps",
         "expired_labels", "overfill_flag", "shelf_attention_flag",
-        "markdown_pct", "gross_margin_pct"
+        "markdown_pct", "gross_margin_pct", "predicted_shrink_prob"
     ]
     safe_show_dataframe(filtered, cols)
 
@@ -837,9 +938,52 @@ elif module == "Auditoría":
 
     cols = [
         "snapshot_date", "lot_id", "store", "supplier", "category", "cut",
-        "audit_score", "hygiene_score", "audit_status"
+        "audit_score", "hygiene_score", "audit_status", "predicted_shrink_prob"
     ]
     safe_show_dataframe(filtered, cols)
+
+elif module == "Predictivo":
+    st.title("Modelo Predictivo de Riesgo / Merma")
+
+    st.markdown(
+        "Este módulo entrena un **RandomForestClassifier** para estimar la "
+        "**probabilidad predictiva de riesgo/merma** por lote."
+    )
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Modelo", predictive_metrics.get("model_type"))
+    k2.metric(
+        "Accuracy",
+        f"{predictive_metrics['accuracy']:.3f}" if predictive_metrics.get("accuracy") is not None else "N/A"
+    )
+    k3.metric(
+        "ROC AUC",
+        f"{predictive_metrics['roc_auc']:.3f}" if predictive_metrics.get("roc_auc") is not None else "N/A"
+    )
+
+    st.subheader("Importancia de variables")
+    if len(feature_importance_df):
+        fig, ax = plt.subplots(figsize=(10, 5))
+        top_imp = feature_importance_df.head(10).sort_values("importance", ascending=True)
+        ax.barh(top_imp["feature"], top_imp["importance"])
+        ax.set_xlabel("Importancia")
+        st.pyplot(fig)
+        st.dataframe(feature_importance_df, use_container_width=True)
+    else:
+        st.info("No hay importancias disponibles. Se usó fallback.")
+
+    st.subheader("Top lotes con mayor probabilidad predictiva")
+    pred_cols = [
+        "lot_id", "store", "supplier", "category", "cut",
+        "risk_score", "predicted_shrink_prob", "predicted_shrink_flag",
+        "remaining_days", "temp_max_c", "hours_out_of_range",
+        "inventory_units", "daily_sales", "recommended_action"
+    ]
+    pred_df = df.sort_values("predicted_shrink_prob", ascending=False).head(50)
+    safe_show_dataframe(pred_df, pred_cols)
+
+    with st.expander("Ver reporte del modelo"):
+        st.text(predictive_metrics.get("report", "Sin reporte"))
 
 elif module == "Dirección y Copiloto IA":
     st.title("Dirección y Copiloto IA")
@@ -870,6 +1014,7 @@ elif module == "Dirección y Copiloto IA":
         "Resume los 5 hallazgos más importantes del día.",
         "¿Dónde debo enfocar auditoría esta semana?",
         "¿Qué categoría tiene mayor riesgo y por qué?",
+        "¿Qué lotes tienen la mayor probabilidad predictiva de merma?"
     ]
     st.markdown("**Preguntas sugeridas:**")
     for q in example_questions:
